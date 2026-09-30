@@ -98,7 +98,7 @@ export async function generateConfig(nodeType, config, installDir) {
   // API node (the static repo file works for those, since they don't run
   // the validator/indexer that need per-chain addresses to be exact).
   if (['full', 'frontend-api', 'api-only', 'validator'].includes(nodeType)) {
-    await writeAddressesForNetwork(config, clientDir)
+    await writeAddressesForNetwork(config, clientDir, installDir)
   }
 
   return { configJsonPath, envPath }
@@ -110,7 +110,7 @@ export async function generateConfig(nodeType, config, installDir) {
  * addresses.ts. The rest of the codebase imports singular constants from
  * addresses.ts and stays multi-chain-unaware.
  */
-export async function writeAddressesForNetwork(config, clientDir) {
+export async function writeAddressesForNetwork(config, clientDir, installDir) {
   const env = config.network || 'testnet'
   const networkId = Number(config.networkId || 1)
   const l1RpcUrl = config.l1RpcUrlHttp || config.l1RpcUrl
@@ -198,13 +198,28 @@ export async function writeAddressesForNetwork(config, clientDir) {
     CAW_ACTIONS_ARCHIVE_ADDRESS: l2.CawActionsArchive,
     CAW_CHALLENGE_RELAY_ADDRESS: l2.CawChallengeRelay,
   }
+  let cawPairAddress
+  if (env === 'mainnet') {
+    cawPairAddress = '0x48D20b3e529fB3DD7D91293f80638dF582AB2Daa'
+  } else if (installDir) {
+    const deployStatePath = path.join(installDir, 'solidity', '.deploy-state.json')
+    try {
+      const deployState = JSON.parse(fs.readFileSync(deployStatePath, 'utf8'))
+      cawPairAddress = deployState.external?.cawWethPair
+    } catch {
+      // Missing/malformed deploy state is handled by the warning below.
+    }
+  }
+
+  if (env !== 'mainnet' && !cawPairAddress) {
+    console.log(warn('  ⚠ CAW_PAIR_ADDRESS unresolved for testnet — no external.cawWethPair in solidity/.deploy-state.json. Refusing to fall back to the mainnet pair.'))
+  }
+
   const staticConsts = {
     WETH_ADDRESS: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
     USDC_ADDRESS: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
     USDT_ADDRESS: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
-    // CAW/WETH Uniswap V2 pair (Base mainnet, locked liquidity). Used by the
-    // ZAP flows (pay-with-ETH mint+deposit / deposit) for slippage quoting.
-    CAW_PAIR_ADDRESS: '0x48D20b3e529fB3DD7D91293f80638dF582AB2Daa',
+    CAW_PAIR_ADDRESS: cawPairAddress,
   }
 
   const lines = [
@@ -215,7 +230,8 @@ export async function writeAddressesForNetwork(config, clientDir) {
     ``,
   ]
   for (const [k, v] of Object.entries(staticConsts)) {
-    lines.push(`export const ${k} = "${v}" as const;`)
+    if (v) lines.push(`export const ${k} = "${v}" as const;`)
+    else lines.push(`export const ${k} = undefined;`)
   }
   // Addresses that are load-bearing enough that a silent `undefined` produces a
   // confusing runtime failure an operator can't easily diagnose. CAW_PROFILE_LENS
