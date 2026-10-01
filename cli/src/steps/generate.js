@@ -198,21 +198,25 @@ export async function writeAddressesForNetwork(config, clientDir, installDir) {
     CAW_ACTIONS_ARCHIVE_ADDRESS: l2.CawActionsArchive,
     CAW_CHALLENGE_RELAY_ADDRESS: l2.CawChallengeRelay,
   }
-  let cawPairAddress
-  if (env === 'mainnet') {
-    cawPairAddress = '0x48D20b3e529fB3DD7D91293f80638dF582AB2Daa'
-  } else if (installDir) {
+  const mainnetCawPair = '0x48D20b3e529fB3DD7D91293f80638dF582AB2Daa'
+  const sepoliaCawPair = '0x6289Fa33B3542ccc6730599f6F3D87F565Ce5d35'
+  let cawPairAddress = env === 'mainnet' ? mainnetCawPair : sepoliaCawPair
+
+  if (env !== 'mainnet' && installDir) {
     const deployStatePath = path.join(installDir, 'solidity', '.deploy-state.json')
     try {
       const deployState = JSON.parse(fs.readFileSync(deployStatePath, 'utf8'))
-      cawPairAddress = deployState.external?.cawWethPair
+      const statePair = deployState.external?.cawWethPair
+      if (statePair) {
+        if (ethers.isAddress(statePair)) {
+          cawPairAddress = statePair
+        } else {
+          console.log(warn(`  ⚠ Ignoring invalid external.cawWethPair in solidity/.deploy-state.json: ${statePair}`))
+        }
+      }
     } catch {
-      // Missing/malformed deploy state is handled by the warning below.
+      // Missing/malformed deploy state keeps the known Sepolia pair above.
     }
-  }
-
-  if (env !== 'mainnet' && !cawPairAddress) {
-    console.log(warn('  ⚠ CAW_PAIR_ADDRESS unresolved for testnet — no external.cawWethPair in solidity/.deploy-state.json. Refusing to fall back to the mainnet pair.'))
   }
 
   const staticConsts = {
@@ -230,8 +234,7 @@ export async function writeAddressesForNetwork(config, clientDir, installDir) {
     ``,
   ]
   for (const [k, v] of Object.entries(staticConsts)) {
-    if (v) lines.push(`export const ${k} = "${v}" as const;`)
-    else lines.push(`export const ${k} = undefined;`)
+    lines.push(`export const ${k} = "${v}" as const;`)
   }
   // Addresses that are load-bearing enough that a silent `undefined` produces a
   // confusing runtime failure an operator can't easily diagnose. CAW_PROFILE_LENS
