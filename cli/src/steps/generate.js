@@ -208,7 +208,11 @@ export async function writeAddressesForNetwork(config, clientDir, installDir) {
       const deployState = JSON.parse(fs.readFileSync(deployStatePath, 'utf8'))
       const statePair = deployState.external?.cawWethPair
       if (statePair) {
-        if (ethers.isAddress(statePair)) {
+        if (
+          typeof statePair === 'string' &&
+          statePair.startsWith('0x') &&
+          ethers.isAddress(statePair)
+        ) {
           cawPairAddress = statePair
         } else {
           console.log(warn(`  ⚠ Ignoring invalid external.cawWethPair in solidity/.deploy-state.json: ${statePair}`))
