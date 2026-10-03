@@ -3,7 +3,7 @@
 
 import { prisma } from '../../prismaClient'
 import { JsonRpcProvider, Contract, verifyTypedData, AbiCoder, dataSlice, id as ethersId } from 'ethers'
-import { makeVerifiedJsonRpcProvider, getL1HttpRpcUrl, getL2HttpRpcUrl, getEthMainnetHttpRpcUrl, redactRpcUrl, isConnectionError } from '../../utils/rpcProvider'
+import { makeVerifiedJsonRpcProvider, getL1HttpRpcUrl, getL2HttpRpcUrl, getEthMainnetHttpRpcUrl, redactRpcUrl, isConnectionError, isRateLimitError } from '../../utils/rpcProvider'
 import { cawNetworkManagerAbi, cawProfileAbi } from '../../abi/generated'
 import { NETWORK_MANAGER_ADDRESS, CAW_NAMES_L2_ADDRESS, CAW_PAIR_ADDRESS, CAW_ADDRESS, CAW_NAMES_ADDRESS } from '../../abi/addresses'
 
@@ -998,8 +998,9 @@ async function syncL2Events(): Promise<void> {
   // Scan in chunks — public RPCs often reject getLogs with ranges > 2-5k blocks
   let cursor = fromBlock + 1
   let totalEvents = 0
+  let chunkSize = L2_EVENT_CHUNK_SIZE
   while (cursor <= latestBlock) {
-    const toBlock = Math.min(cursor + L2_EVENT_CHUNK_SIZE - 1, latestBlock)
+    const toBlock = Math.min(cursor + chunkSize - 1, latestBlock)
 
     try {
       // Sequential to avoid ethers' RPC batching — see MarketplaceIndexer
@@ -1029,14 +1030,23 @@ async function syncL2Events(): Promise<void> {
 
       totalEvents += combined.length
       await setLastSyncedL2Block(toBlock)
+      cursor = toBlock + 1
     } catch (err: any) {
+      if (!isConnectionError(err) && !isRateLimitError(err) && chunkSize > 1) {
+        const nextChunkSize = Math.max(1, Math.floor(chunkSize / 2))
+        console.warn(
+          `[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}; ` +
+          `retrying with ${nextChunkSize}-block chunks: ${err.message?.slice(0, 200)}`
+        )
+        chunkSize = nextChunkSize
+        continue
+      }
+
       console.error(`[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}:`, err.message?.slice(0, 200))
       maybeRebuildProviders(err)
       // Break out — next tick will retry from the current cursor
       return
     }
-
-    cursor = toBlock + 1
   }
 
   if (totalEvents > 0) {
