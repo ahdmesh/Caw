@@ -19,7 +19,21 @@ import getActionType from '../../abi/getActionType'
 // rewriter does for static imports. No circular-import risk: StakeLedger
 // only `type`-imports from ActionProcessor/types (erased at compile time).
 // Reported by Zin running the standard .nvmrc environment.
-import { verifyMultiplier, recordAction } from '../StakeLedger'
+import {
+  verifyMultiplier,
+  recordAction,
+  RecoverableStakeLedgerDriftError,
+  markRepairRequired,
+  reconcileFromL2Block,
+  isRepairRequired,
+} from '../StakeLedger'
+
+class StakeLedgerRecoveryBarrierError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message)
+    this.name = 'StakeLedgerRecoveryBarrierError'
+  }
+}
 
 const Config = z.object({
   redisUrl: z.string().optional().default('redis://127.0.0.1:6379'),
@@ -37,6 +51,7 @@ export const actionProcessorService: Service = {
     const { redisUrl } = Config.parse(_cfg)
     const redis = new Redis(redisUrl)
     let stopRequested = false
+    let stakeLedgerRecoveryBlocked = false
 
     // ActionProcessor is event-driven (Redis pub/sub). We heartbeat on each
     // message processed AND via a periodic idle ping so the watchdog knows
@@ -48,7 +63,19 @@ export const actionProcessorService: Service = {
 
     const started = (async () => {
       await prisma.$connect()
-      ctx.heartbeat('listen') // Mark alive after connect
+
+      // A confirmed StakeLedger inconsistency must survive process restart.
+      // Keep the service alive for observability, but do not resume ordered
+      // replay until an authoritative repair has cleared the durable guard.
+      if (await isRepairRequired()) {
+        stakeLedgerRecoveryBlocked = true
+        console.error(
+          '[ActionProcessor] Durable StakeLedger repair-required guard is set; ' +
+          'ordered replay remains blocked pending authoritative repair',
+        )
+      }
+
+      ctx.heartbeat('listen') // Service is alive even when ordered replay is intentionally blocked
 
       // Resume from last processed action's rawEventId instead of reprocessing everything on restart
       const lastAction = await prisma.action.findFirst({
@@ -61,7 +88,7 @@ export const actionProcessorService: Service = {
       // Page through the backlog in chunks so restart after a large gap doesn't
       // load everything into memory at once. At 1M raw events this would OOM.
       const BACKLOG_CHUNK = 1000
-      while (!stopRequested) {
+      while (!stopRequested && !stakeLedgerRecoveryBlocked) {
         const backlog = await prisma.rawEvent.findMany({
           where: {
             id: { gt: lastId },
@@ -87,6 +114,16 @@ export const actionProcessorService: Service = {
             await handleRawEvent(raw, /* skipVerify */ !atBlockBoundary)
             lastId = raw.id
           } catch (err) {
+            if (err instanceof StakeLedgerRecoveryBarrierError) {
+              stakeLedgerRecoveryBlocked = true
+            }
+            if (stakeLedgerRecoveryBlocked) {
+              console.error(
+                `[ActionProcessor] StakeLedger recovery barrier at backlog event ${raw.id}; ` +
+                `ordered replay stopped pending authoritative repair`,
+              )
+              throw err
+            }
             if (err instanceof StaleTokenError) {
               console.warn(`[ActionProcessor] Skipping stale event ${raw.id}: ${err.message}`)
               lastId = raw.id
@@ -151,7 +188,7 @@ export const actionProcessorService: Service = {
         processChain = processChain.then(async () => {
           // Re-check inside the serialized section: an earlier queued event
           // (or a duplicate publish) may have already advanced lastId past us.
-          if (rawEventId <= lastId || stopRequested) return
+          if (rawEventId <= lastId || stopRequested || stakeLedgerRecoveryBlocked) return
           const raw = await prisma.rawEvent.findUnique({ where: { id: rawEventId } })
           if (!raw || stopRequested) return
           try {
@@ -160,6 +197,15 @@ export const actionProcessorService: Service = {
             lastId = rawEventId
             scheduleVerify()
           } catch (err) {
+            if (err instanceof StakeLedgerRecoveryBarrierError) {
+              stakeLedgerRecoveryBlocked = true
+              console.error(
+                `[ActionProcessor] StakeLedger recovery barrier at live event ${rawEventId}; ` +
+                `ordered replay stopped pending authoritative repair`,
+                err,
+              )
+              return
+            }
             if (err instanceof StaleTokenError) {
               console.warn(`[ActionProcessor] Skipping stale event ${rawEventId}: ${(err as Error).message}`)
               lastId = rawEventId
@@ -188,7 +234,7 @@ export const actionProcessorService: Service = {
       retryTimer = setInterval(() => {
         if (stopRequested) return
         processChain = processChain.then(async () => {
-          if (stopRequested) return
+          if (stopRequested || stakeLedgerRecoveryBlocked) return
           const touched = await retryFailedEvents()
           if (touched) scheduleVerify()
         }).catch(err => {
@@ -209,7 +255,7 @@ export const actionProcessorService: Service = {
       stats: async () => {
         const failed = await loadFailedEvents()
         const n = Object.keys(failed).length
-        return `actions: ${await prisma.action.count()}${n > 0 ? `, failed-events awaiting retry: ${n}` : ''}`
+        return `actions: ${await prisma.action.count()}${n > 0 ? `, failed-events awaiting retry: ${n}` : ''}${stakeLedgerRecoveryBlocked ? ', stake-ledger repair required: ordered replay blocked' : ''}`
       },
     }
   }
@@ -547,6 +593,44 @@ async function handleRawAction(raw: { id: number, chainId: number, blockNumber: 
       // Prisma deadlock retry).
       postCommit?.()
     } catch (err: any) {
+      if (err instanceof RecoverableStakeLedgerDriftError) {
+        const involvedTokenIds = Array.from(new Set([
+          Number(rawAction.senderId),
+          ...(rawAction.receiverId !== undefined ? [Number(rawAction.receiverId)] : []),
+          ...(rawAction.recipients ?? []).map(Number),
+        ].filter(tokenId => Number.isSafeInteger(tokenId) && tokenId > 0)))
+
+        console.warn(
+          `[ActionProcessor] Recoverable StakeLedger drift at block=${err.blockNumber} ` +
+          `logIndex=${err.logIndex}; reconciling authoritative L2 state`,
+        )
+
+        try {
+          await markRepairRequired()
+        } catch (markErr: any) {
+          console.error(
+            '[ActionProcessor] Failed to persist StakeLedger repair-required guard; ' +
+            'runtime remains halted and authoritative reconciliation will still be attempted:',
+            markErr?.message ?? markErr,
+          )
+        }
+
+        try {
+          await reconcileFromL2Block(err.blockNumber, involvedTokenIds)
+        } catch (reconcileErr: any) {
+          console.error(
+            '[ActionProcessor] StakeLedger recovery FAILED; blocking ordered replay:',
+            reconcileErr?.message ?? reconcileErr,
+          )
+          throw new StakeLedgerRecoveryBarrierError(
+            `StakeLedger reconciliation failed at block ${err.blockNumber}`,
+            reconcileErr,
+          )
+        }
+
+        return
+      }
+
       console.error('[ActionProcessor] StakeLedger snapshot failed (domain rows committed):', err?.message ?? err)
     }
   })

@@ -1031,8 +1031,9 @@ model StakeLedgerState {
   totalCaw     String
   multiplier   String
   lastBlock    BigInt
-  lastLogIndex Int
-  updatedAt    DateTime @default(now())
+  lastLogIndex   Int
+  repairRequired Boolean  @default(false)
+  updatedAt      DateTime @default(now())
   networkId    Int      @id
 }
 
