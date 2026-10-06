@@ -31,6 +31,8 @@ function noWriteTx(): any {
   }
 
   return {
+    $queryRawUnsafe: async () => [],
+    stakeLedgerRepairGuard: { findUnique: async () => null },
     rewardMultiplierSnapshot: { createMany: fail },
     cawOwnershipSnapshot: { createMany: fail },
     cawOwnershipCurrent: { upsert: fail },
