@@ -5,6 +5,7 @@ process.env.CLIENT_ID = '1'
 import {
   ensureBooted,
   isRepairRequired,
+  markRepairRequired,
   _resetForTests,
   _setPrismaForTests,
   _setActionsContractForTests,
@@ -22,7 +23,7 @@ describe('StakeLedger / repairRequired restart guard', () => {
 
   it('reads the durable repair guard without booting the full StakeLedger', async () => {
     _setPrismaForTests({
-      stakeLedgerState: {
+      stakeLedgerRepairGuard: {
         findUnique: async () => ({ repairRequired: true }),
       },
     } as any)
@@ -32,12 +33,82 @@ describe('StakeLedger / repairRequired restart guard', () => {
 
   it('treats a missing StakeLedgerState row as not repair-required', async () => {
     _setPrismaForTests({
-      stakeLedgerState: {
+      stakeLedgerRepairGuard: {
         findUnique: async () => null,
       },
     } as any)
 
     expect(await isRepairRequired()).to.equal(false)
+  })
+
+  it('persists repair-required independently when StakeLedgerState is missing', async () => {
+    let guardUpsert: any = null
+
+    const tx = {
+      $queryRawUnsafe: async () => [],
+      stakeLedgerRepairGuard: {
+        upsert: async (args: any) => {
+          guardUpsert = args
+          return {}
+        },
+      },
+    }
+
+    _setPrismaForTests({
+      stakeLedgerState: {
+        findUnique: async () => null,
+      },
+      stakeLedgerRepairGuard: {
+        findUnique: async () => null,
+      },
+      cawOwnershipCurrent: {
+        findMany: async () => [],
+      },
+      chainData: {
+        findUnique: async () => null,
+        upsert: async () => ({}),
+      },
+      $transaction: async (fn: any) => await fn(tx),
+    } as any)
+
+    _setActionsContractForTests({
+      capState: async () => [0n, 0n],
+    })
+
+    await markRepairRequired()
+
+    expect(guardUpsert).to.not.equal(null)
+    expect(guardUpsert.where.networkId).to.equal(1)
+    expect(guardUpsert.create.repairRequired).to.equal(true)
+    expect(guardUpsert.update.repairRequired).to.equal(true)
+  })
+
+  it('restores halted=true from the independent guard even when StakeLedgerState is missing', async () => {
+    _setPrismaForTests({
+      stakeLedgerState: {
+        findUnique: async () => null,
+      },
+      stakeLedgerRepairGuard: {
+        findUnique: async () => ({ repairRequired: true }),
+      },
+      cawOwnershipCurrent: {
+        findMany: async () => [],
+      },
+      chainData: {
+        findUnique: async () => null,
+        upsert: async () => ({}),
+      },
+    } as any)
+
+    _setActionsContractForTests({
+      capState: async () => [0n, 0n],
+    })
+
+    const booted = await ensureBooted()
+
+    expect(booted.halted).to.equal(true)
+    expect(booted.lastBlock).to.equal(0n)
+    expect(booted.lastLogIndex).to.equal(-1)
   })
 
   it('restores halted=true from durable repairRequired=true after process-memory reset', async () => {
@@ -49,9 +120,11 @@ describe('StakeLedger / repairRequired restart guard', () => {
           totalCaw: '1234',
           lastBlock: 100n,
           lastLogIndex: 7,
-          repairRequired: true,
           updatedAt: new Date(),
         }),
+      },
+      stakeLedgerRepairGuard: {
+        findUnique: async () => ({ repairRequired: true }),
       },
       cawOwnershipCurrent: {
         findMany: async () => [

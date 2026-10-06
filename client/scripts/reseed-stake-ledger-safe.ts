@@ -1,10 +1,13 @@
 import 'dotenv/config'
 import { Contract } from 'ethers'
-import { makeJsonRpcProvider, getL2HttpRpcUrl, getL1HttpRpcUrl } from '../src/utils/rpcProvider'
+import { makeFallbackJsonRpcProvider, getL2HttpRpcUrls, getL1HttpRpcUrls } from '../src/utils/rpcProvider'
+import { assertStrictRpcChains } from './stake-ledger-repair-rpc'
 import { cawProfileLedgerAbi, cawProfileAbi } from '../src/abi/generated'
 import { CAW_NAMES_L2_ADDRESS, CAW_NAMES_ADDRESS } from '../src/abi/addresses'
 import { prisma } from '../src/prismaClient'
 import { getNetworkId } from '../src/utils/networkId'
+import { acquireRepairExclusiveLock } from '../src/services/StakeLedger/repairGuard'
+import { assertStakeLedgerRepairAuthority } from './stake-ledger-repair-authority'
 
 const CURSOR_SENTINEL = 2_147_483_647
 const PRECISION = 10n ** 18n
@@ -23,14 +26,51 @@ async function main() {
   const apply = process.argv.includes('--apply')
   const clientId = requireClientId()
 
-  const l2Url = getL2HttpRpcUrl()
-  if (!l2Url) throw new Error('L2 RPC not configured')
+  assertStakeLedgerRepairAuthority(apply)
 
-  const l1Url = getL1HttpRpcUrl()
-  if (!l1Url) throw new Error('L1 RPC not configured')
+  // APPLY is an explicit repair transition. The operator-facing CLI has
+  // already quiesced the runtime before granting repair authority.
+  // Persist repair-required before any RPC scan so every later failure
+  // remains durably fail-closed.
+  if (apply) {
+    await prisma.$transaction(async tx => {
+      await acquireRepairExclusiveLock(tx, clientId)
+      await tx.stakeLedgerRepairGuard.upsert({
+        where: { networkId: clientId },
+        create: {
+          networkId: clientId,
+          repairRequired: true,
+        },
+        update: {
+          repairRequired: true,
+        },
+      })
+    })
+  }
 
-  const l2Provider = makeJsonRpcProvider(l2Url, 84532)
-  const l1Provider = makeJsonRpcProvider(l1Url, 11155111)
+  const l2Urls = getL2HttpRpcUrls()
+  if (l2Urls.length === 0) throw new Error('L2 RPC not configured')
+
+  const l1Urls = getL1HttpRpcUrls()
+  if (l1Urls.length === 0) throw new Error('L1 RPC not configured')
+
+  const l2ChainId = Number(process.env.L2_CHAIN_ID ?? 84532)
+  const l1ChainId = Number(process.env.L1_CHAIN_ID ?? 11155111)
+
+  if (!Number.isSafeInteger(l2ChainId) || l2ChainId <= 0) {
+    throw new Error(`invalid L2_CHAIN_ID=${process.env.L2_CHAIN_ID}`)
+  }
+  if (!Number.isSafeInteger(l1ChainId) || l1ChainId <= 0) {
+    throw new Error(`invalid L1_CHAIN_ID=${process.env.L1_CHAIN_ID}`)
+  }
+
+  // Authoritative repair is fail-closed: every configured RPC must prove
+  // its real chain ID before any authoritative state is read.
+  await assertStrictRpcChains(l2Urls, l2ChainId, 'L2')
+  await assertStrictRpcChains(l1Urls, l1ChainId, 'L1')
+
+  const l2Provider = makeFallbackJsonRpcProvider(l2Urls, l2ChainId)
+  const l1Provider = makeFallbackJsonRpcProvider(l1Urls, l1ChainId)
 
   const l2 = new Contract(
     CAW_NAMES_L2_ADDRESS,
@@ -132,29 +172,6 @@ async function main() {
     return
   }
 
-  // Safety check: every minted token currently has a corresponding User.
-  // Do not partially repair User mirrors if the local index is incomplete.
-  const users = await prisma.user.findMany({
-    where: {
-      tokenId: {
-        gte: 1,
-        lte: maxId,
-      },
-    },
-    select: { tokenId: true },
-  })
-
-  const userTokenIds = new Set(users.map(u => u.tokenId))
-  const missingUsers = rows
-    .map(r => r.tokenId)
-    .filter(tokenId => !userTokenIds.has(tokenId))
-
-  if (missingUsers.length > 0) {
-    throw new Error(
-      `User index incomplete; refusing DB write. Missing tokenIds: ${missingUsers.join(',')}`,
-    )
-  }
-
   const now = new Date()
 
   // One atomic repair:
@@ -164,6 +181,8 @@ async function main() {
   //
   // CawOwnershipSnapshot is intentionally untouched.
   await prisma.$transaction(async tx => {
+    await acquireRepairExclusiveLock(tx, clientId)
+
     await tx.stakeLedgerState.upsert({
       where: { networkId: clientId },
       create: {
@@ -172,14 +191,12 @@ async function main() {
         totalCaw: totalCaw.toString(),
         lastBlock: BigInt(H),
         lastLogIndex: CURSOR_SENTINEL,
-        repairRequired: false,
       },
       update: {
         multiplier: multiplier.toString(),
         totalCaw: totalCaw.toString(),
         lastBlock: BigInt(H),
         lastLogIndex: CURSOR_SENTINEL,
-        repairRequired: false,
         updatedAt: now,
       },
     })
@@ -196,7 +213,7 @@ async function main() {
     }
 
     for (const row of rows) {
-      await tx.user.update({
+      await tx.user.updateMany({
         where: { tokenId: row.tokenId },
         data: {
           onChainStakeWei: row.balance.toString(),
@@ -204,6 +221,19 @@ async function main() {
         },
       })
     }
+
+    // Clear the durable guard only after every authoritative replacement
+    // above has succeeded. A rollback therefore leaves repair required.
+    await tx.stakeLedgerRepairGuard.upsert({
+      where: { networkId: clientId },
+      create: {
+        networkId: clientId,
+        repairRequired: false,
+      },
+      update: {
+        repairRequired: false,
+      },
+    })
   }, { timeout: 30_000 })
 
   console.log(`[safe-reseed] APPLY PASS: DB atomically reseeded from L2 block ${H}`)

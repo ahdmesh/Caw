@@ -27,9 +27,10 @@ function makeState(overrides: Partial<RuntimeState> = {}): RuntimeState {
   }
 }
 
-function makePrisma() {
+function makePrisma(userRows = [{ tokenId: 1 }, { tokenId: 2 }]) {
   let transactionCalls = 0
   let stateUpsert: any = null
+  let repairGuardUpsert: any = null
   let deletedCurrent = false
   let createdCurrent: any[] = []
   const userUpdates: any[] = []
@@ -41,6 +42,13 @@ function makePrisma() {
         return {}
       },
     },
+    stakeLedgerRepairGuard: {
+      upsert: async (args: any) => {
+        repairGuardUpsert = args
+        return {}
+      },
+    },
+    $queryRawUnsafe: async () => [],
     cawOwnershipCurrent: {
       deleteMany: async () => {
         deletedCurrent = true
@@ -52,16 +60,16 @@ function makePrisma() {
       },
     },
     user: {
-      update: async (args: any) => {
+      updateMany: async (args: any) => {
         userUpdates.push(args)
-        return {}
+        return { count: 1 }
       },
     },
   }
 
   const mock = {
     user: {
-      findMany: async () => [{ tokenId: 1 }, { tokenId: 2 }],
+      findMany: async () => userRows,
     },
     cawOwnershipCurrent: {
       findMany: async () => [{ tokenId: 1 }, { tokenId: 2 }],
@@ -77,6 +85,7 @@ function makePrisma() {
     inspect: () => ({
       transactionCalls,
       stateUpsert,
+      repairGuardUpsert,
       deletedCurrent,
       createdCurrent,
       userUpdates,
@@ -134,8 +143,16 @@ describe('StakeLedger / reconcileFromL2Block', () => {
     expect(written.stateUpsert.update.totalCaw).to.equal('5000')
     expect(written.stateUpsert.update.lastBlock).to.equal(100n)
     expect(written.stateUpsert.update.lastLogIndex).to.equal(2147483647)
-    expect(written.stateUpsert.update.repairRequired).to.equal(false)
-    expect(written.stateUpsert.create.repairRequired).to.equal(false)
+    expect(written.repairGuardUpsert).to.deep.equal({
+      where: { networkId: 1 },
+      create: {
+        networkId: 1,
+        repairRequired: false,
+      },
+      update: {
+        repairRequired: false,
+      },
+    })
 
     expect(written.userUpdates).to.have.length(2)
 
@@ -152,6 +169,39 @@ describe('StakeLedger / reconcileFromL2Block', () => {
     // Dynamic-cost cap belongs to its independent refresh path and survives recovery.
     expect(next.capRatio).to.equal(123n)
     expect(next.capLastUpdatedAt).to.equal(456n)
+  })
+
+  it('recovers authoritative ownership even when matching User rows are missing', async () => {
+    _injectStateForTests(makeState())
+
+    _setContractForTests({
+      rewardMultiplier: async () => PRECISION + 10n,
+      totalCaw: async () => 5000n,
+      cawOwnership: async (tokenId: number) => {
+        if (tokenId === 1) return 1000n
+        if (tokenId === 2) return 2000n
+        throw new Error(`unexpected token ${tokenId}`)
+      },
+    })
+
+    const db = makePrisma([])
+    _setReconcilePrismaForTests(db.mock)
+
+    await reconcileFromL2Block(100n)
+
+    const written = db.inspect()
+    expect(written.transactionCalls).to.equal(1)
+    expect(written.createdCurrent).to.deep.equal([
+      { tokenId: 1, ownership: '1000' },
+      { tokenId: 2, ownership: '2000' },
+    ])
+    expect(written.userUpdates).to.have.length(2)
+    expect(written.repairGuardUpsert.update.repairRequired).to.equal(false)
+
+    const next = _peekState()!
+    expect(next.ownership.get(1)).to.equal(1000n)
+    expect(next.ownership.get(2)).to.equal(2000n)
+    expect(next.halted).to.equal(false)
   })
 
   it('leaves runtime state untouched when the database transaction fails after fixed-block reads succeed', async () => {

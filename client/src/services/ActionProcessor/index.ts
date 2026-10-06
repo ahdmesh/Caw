@@ -23,6 +23,7 @@ import {
   verifyMultiplier,
   recordAction,
   RecoverableStakeLedgerDriftError,
+  StakeLedgerRepairRequiredError,
   markRepairRequired,
   reconcileFromL2Block,
   isRepairRequired,
@@ -177,7 +178,21 @@ export const actionProcessorService: Service = {
         if (verifyTimer) clearTimeout(verifyTimer)
         verifyTimer = setTimeout(() => {
           verifyTimer = null
-          if (!stopRequested) runVerifyMultiplier().catch(() => {})
+          if (stopRequested || stakeLedgerRecoveryBlocked) return
+
+          runVerifyMultiplier().catch(err => {
+            if (err instanceof StakeLedgerRecoveryBarrierError) {
+              stakeLedgerRecoveryBlocked = true
+              console.error(
+                '[ActionProcessor] StakeLedger recovery barrier during live multiplier verification; ' +
+                  'ordered replay stopped pending authoritative repair',
+                err,
+              )
+              return
+            }
+
+            console.warn('[ActionProcessor] Live multiplier verification failed:', err)
+          })
         }, VERIFY_DEBOUNCE_MS)
       }
 
@@ -238,6 +253,16 @@ export const actionProcessorService: Service = {
           const touched = await retryFailedEvents()
           if (touched) scheduleVerify()
         }).catch(err => {
+          if (err instanceof StakeLedgerRecoveryBarrierError) {
+            stakeLedgerRecoveryBlocked = true
+            console.error(
+              '[ActionProcessor] StakeLedger recovery barrier during retry; ' +
+                'ordered replay stopped pending authoritative repair',
+              err,
+            )
+            return
+          }
+
           console.error('[ActionProcessor] Retry pass error:', err)
         })
       }, RETRY_INTERVAL_MS)
@@ -353,6 +378,10 @@ async function retryFailedEvents(): Promise<boolean> {
       touched = true
       changed = true
     } catch (err) {
+      if (err instanceof StakeLedgerRecoveryBarrierError) {
+        throw err
+      }
+
       if (err instanceof StaleTokenError) {
         console.warn(`[ActionProcessor] Retry: event ${rawEventId} is stale; dropping from registry: ${err.message}`)
         delete reg[id]
@@ -435,6 +464,13 @@ async function runVerifyMultiplier(): Promise<void> {
   try {
     await verifyMultiplier()
   } catch (err) {
+    if (err instanceof StakeLedgerRepairRequiredError) {
+      throw new StakeLedgerRecoveryBarrierError(
+        'StakeLedger multiplier divergence requires authoritative repair',
+        err,
+      )
+    }
+
     console.warn('[ActionProcessor] StakeLedger verifyMultiplier failed:', err)
   }
 }
@@ -593,6 +629,13 @@ async function handleRawAction(raw: { id: number, chainId: number, blockNumber: 
       // Prisma deadlock retry).
       postCommit?.()
     } catch (err: any) {
+      if (err instanceof StakeLedgerRepairRequiredError) {
+        throw new StakeLedgerRecoveryBarrierError(
+          'StakeLedger repair required; blocking ordered replay',
+          err,
+        )
+      }
+
       if (err instanceof RecoverableStakeLedgerDriftError) {
         const involvedTokenIds = Array.from(new Set([
           Number(rawAction.senderId),
@@ -610,8 +653,12 @@ async function handleRawAction(raw: { id: number, chainId: number, blockNumber: 
         } catch (markErr: any) {
           console.error(
             '[ActionProcessor] Failed to persist StakeLedger repair-required guard; ' +
-            'runtime remains halted and authoritative reconciliation will still be attempted:',
+            'authoritative reconciliation will not proceed without the durable barrier:',
             markErr?.message ?? markErr,
+          )
+          throw new StakeLedgerRecoveryBarrierError(
+            'Failed to persist StakeLedger repair-required guard',
+            markErr,
           )
         }
 
