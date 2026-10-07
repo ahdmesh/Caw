@@ -246,6 +246,16 @@ export default async function listenForRawEvents(
     /** Scope this indexer to one client; actions for other clients are dropped. */
     networkId: number
     startBlock?: number // Minimum block to start scanning from (avoids old contract events)
+    sourceEvidenceProvider: {
+      /**
+       * Persist the immutable source-log occurrence before any calldata
+       * decoding, action expansion, or RawEvent projection.
+       *
+       * Re-observing the same occurrence must be idempotent only when all
+       * immutable evidence matches; contradictions must reject.
+       */
+      capture(log: Log): Promise<void>
+    }
     rawEventsProvider: {
       getLastProcessedEvent(): Promise<{
         blockNumber: number
@@ -600,6 +610,15 @@ export default async function listenForRawEvents(
   // range on every restart where the skip fires. Keeping `past` intact
   // preserves the real high-water mark for that read while still avoiding
   // the processEvents() call itself.
+  // Capture immutable source-log evidence before any projection shortcut.
+  // Even when every RawEvent already exists, `past` came from the source RPC
+  // and must be recorded independently rather than inferred from RawEvent.
+  // Keep this sequential so a failed/contradictory capture stops the
+  // historical fill before markFloorFilled() can advance durable state.
+  for (const log of past) {
+    await config.sourceEvidenceProvider.capture(log)
+  }
+
   const skipDerive =
     past.length > 0 &&
     !!config.rawEventsProvider.countExisting &&
@@ -646,6 +665,11 @@ export default async function listenForRawEvents(
       ) => {
         console.log("[RawEventsGatherer] Raw event received via WebSocket", ev)
         try {
+          // Persist the source occurrence before calldata interpretation or
+          // RawEvent projection. On failure this WS delivery is skipped; the
+          // HTTP poller remains the source-of-truth recovery path.
+          await config.sourceEvidenceProvider.capture(ev.log)
+
           const packedResult = await fetchPackedActionsFromTx(httpProvider, ev.log.transactionHash)
           if (packedResult.kind !== 'ok') {
             // WebSocket path has no block-cursor to protect (HTTP polling
@@ -743,6 +767,11 @@ export default async function listenForRawEvents(
         ) => {
           console.log("[RawEventsGatherer] ERC-1271 raw event received via WebSocket", ev)
           try {
+            // B1 records only the source occurrence here. Mapping this event
+            // to its ERC-1271 calldata group is interpretation evidence and
+            // deliberately belongs to B2.
+            await config.sourceEvidenceProvider.capture(ev.log)
+
             const packedResult = await fetchPackedActionsFromTx(httpProvider, ev.log.transactionHash)
             if (packedResult.kind !== 'ok') {
               // Same reasoning as the sibling WS handler above: no
@@ -997,6 +1026,13 @@ export default async function listenForRawEvents(
         )
 
         if (events.length > 0) {
+          // Persist source evidence before interpretation/projection. If any
+          // capture fails, the surrounding poll try/catch leaves
+          // lastSyncedBlock unchanged so this range is retried.
+          for (const log of events) {
+            await config.sourceEvidenceProvider.capture(log)
+          }
+
           // Span scope is "actually processing fetched events" — the
           // getBlockNumber + queryFilter calls above are auto-instrumented
           // by the http instrumentation, so they show up regardless.

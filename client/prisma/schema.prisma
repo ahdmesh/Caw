@@ -1368,3 +1368,36 @@ model WalletBlob {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 }
+
+/// Immutable evidence of an observed source-chain log occurrence.
+///
+/// This row records what the gatherer observed before calldata decoding,
+/// action expansion, or RawEvent projection. Its existence does NOT imply
+/// that the occurrence is canonical, finalized, accepted, or semantically
+/// verified.
+///
+/// `chainId` is the configured source-chain namespace used by the gatherer;
+/// it must not be interpreted as proof that every backing RPC endpoint was
+/// independently chain-ID verified.
+model CanonicalSourceEvidence {
+  id               BigInt   @id @default(autoincrement())
+
+  chainId          BigInt
+  blockNumber      BigInt
+  blockHash        String   @db.VarChar(66)
+  transactionHash  String   @db.VarChar(66)
+  transactionIndex Int
+  sourceLogIndex   Int
+  emitter          String   @db.VarChar(42)
+
+  topics           String[]
+  eventData        String
+
+  /// Local observation time, not the source block timestamp.
+  firstObservedAt  DateTime @db.Timestamptz(6)
+  createdAt        DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([chainId, blockHash, sourceLogIndex])
+  @@index([chainId, blockNumber, transactionIndex, sourceLogIndex])
+  @@index([chainId, transactionHash])
+}
