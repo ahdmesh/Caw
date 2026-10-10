@@ -1002,14 +1002,36 @@ async function syncL2Events(): Promise<void> {
   while (cursor <= latestBlock) {
     const toBlock = Math.min(cursor + chunkSize - 1, latestBlock)
 
+    let created: any[]
+    let revoked: any[]
+    let authed: any[]
+
+    // Adaptive range retry applies only to event fetching.
     try {
       // Sequential to avoid ethers' RPC batching — see MarketplaceIndexer
       // comment for rationale. Batched member-failures on rate limit are
       // far more painful than a 300ms serial latency hit.
-      const created = await contract.queryFilter(contract.filters.SessionCreated(), cursor, toBlock)
-      const revoked = await contract.queryFilter(contract.filters.SessionRevoked(), cursor, toBlock)
-      const authed = await contract.queryFilter(contract.filters.Authenticated(), cursor, toBlock)
+      created = await contract.queryFilter(contract.filters.SessionCreated(), cursor, toBlock)
+      revoked = await contract.queryFilter(contract.filters.SessionRevoked(), cursor, toBlock)
+      authed = await contract.queryFilter(contract.filters.Authenticated(), cursor, toBlock)
+    } catch (err: any) {
+      if (!isConnectionError(err) && !isRateLimitError(err) && chunkSize > 1) {
+        const nextChunkSize = Math.max(1, Math.floor(chunkSize / 2))
+        console.warn(
+          `[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}; ` +
+          `retrying with ${nextChunkSize}-block chunks: ${err.message?.slice(0, 200)}`
+        )
+        chunkSize = nextChunkSize
+        continue
+      }
 
+      console.error(`[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}:`, err.message?.slice(0, 200))
+      maybeRebuildProviders(err)
+      return
+    }
+
+    // Processing and cursor persistence must not trigger range shrinking.
+    try {
       // Process in block/logIndex order to handle a revoke+create in the same block correctly
       const combined = [
         ...created.map(e => ({ ev: e, kind: 'created' as const })),
@@ -1032,19 +1054,12 @@ async function syncL2Events(): Promise<void> {
       await setLastSyncedL2Block(toBlock)
       cursor = toBlock + 1
     } catch (err: any) {
-      if (!isConnectionError(err) && !isRateLimitError(err) && chunkSize > 1) {
-        const nextChunkSize = Math.max(1, Math.floor(chunkSize / 2))
-        console.warn(
-          `[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}; ` +
-          `retrying with ${nextChunkSize}-block chunks: ${err.message?.slice(0, 200)}`
-        )
-        chunkSize = nextChunkSize
-        continue
-      }
-
-      console.error(`[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}:`, err.message?.slice(0, 200))
+      console.error(
+        `[ChainSync:L2Events] Event processing or cursor persistence failed for range ${cursor}-${toBlock}:`,
+        err.message?.slice(0, 200)
+      )
       maybeRebuildProviders(err)
-      // Break out — next tick will retry from the current cursor
+      // Preserve the existing stop-and-retry-on-next-tick behavior.
       return
     }
   }
