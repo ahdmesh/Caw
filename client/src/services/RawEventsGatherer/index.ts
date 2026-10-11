@@ -2,7 +2,6 @@
 import { z } from 'zod'
 import Redis from 'ioredis'
 import type { Log } from 'ethers'
-import { captureSourceEvidence } from './sourceEvidence'
 import { Service } from '../../Service'
 import listenForRawEvents, { RawEventInput, getRawEventsPollIntervalMs } from './listenForRawEvents'
 import { convertBigIntsToStrings } from "./utils";
@@ -147,10 +146,6 @@ export const rawEventsGathererService: Service = {
         return total
       }
 
-      const captureSourceLog = async (log: import('ethers').Log): Promise<void> => {
-        await captureSourceEvidence(prisma.canonicalSourceEvidence, chainId, log)
-      }
-
       const store = async (e: RawEventInput) => {
         return await prisma.rawEvent.upsert({
           where: {
@@ -267,9 +262,6 @@ export const rawEventsGathererService: Service = {
         networkId,
         contractAddress: CAW_ACTIONS_ADDRESS,
         startBlock: resolvedStartBlock,
-        sourceEvidenceProvider: {
-          capture: captureSourceLog,
-        },
         rawEventsProvider: {
           getLastProcessedEvent: getLast,
           storeEvent:            storeAndPublish,
