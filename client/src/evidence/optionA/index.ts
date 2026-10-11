@@ -1,0 +1,1 @@
+export { mapNormal } from './mapping';

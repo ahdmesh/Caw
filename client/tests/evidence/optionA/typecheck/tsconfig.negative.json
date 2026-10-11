@@ -1,0 +1,7 @@
+{
+  "extends": "../../../../tsconfig.optiona.json",
+  "include": [
+    "../../../../src/evidence/optionA/**/*.ts",
+    "./negative-type-contracts.ts"
+  ]
+}

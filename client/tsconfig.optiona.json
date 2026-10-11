@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "noEmit": true,
+    "exactOptionalPropertyTypes": true,
+    "incremental": false,
+    "composite": false,
+    "skipLibCheck": false,
+    "types": []
+  },
+  "include": [
+    "src/evidence/optionA/**/*.ts",
+    "tests/evidence/optionA/typecheck/type-contracts.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}
