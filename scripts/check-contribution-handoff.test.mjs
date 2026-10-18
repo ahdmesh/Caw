@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { validateContributionHandoff } from './check-contribution-handoff.mjs'
@@ -64,4 +66,40 @@ test('the local CLI reports missing input and exits nonzero', () => {
   const result = spawnSync(process.execPath, [fileURLToPath(checkerUrl)], { encoding: 'utf8' })
   assert.equal(result.status, 2)
   assert.match(result.stderr, /Usage:/)
+})
+
+test('the CLI rejects invalid input when invoked through a symlinked script or directory', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'caw-handoff-test-'))
+  try {
+    const invalidFile = join(tempDir, 'invalid.json')
+    writeFileSync(invalidFile, '')
+
+    const linkedScript = join(tempDir, 'linked-checker.mjs')
+    symlinkSync(fileURLToPath(checkerUrl), linkedScript)
+
+    const linkedRoot = join(tempDir, 'linked-root')
+    symlinkSync(fileURLToPath(new URL('../', import.meta.url)), linkedRoot, 'dir')
+    const linkedDirScript = join(linkedRoot, 'scripts', 'check-contribution-handoff.mjs')
+
+    for (const script of [linkedScript, linkedDirScript]) {
+      const invalid = spawnSync(process.execPath, [script, invalidFile], { encoding: 'utf8' })
+      assert.equal(invalid.status, 1, script + ': ' + invalid.stderr)
+      assert.match(invalid.stderr, /FAIL/)
+
+      const missing = spawnSync(process.execPath, [script], { encoding: 'utf8' })
+      assert.equal(missing.status, 2, script + ': ' + missing.stderr)
+      assert.match(missing.stderr, /Usage:/)
+    }
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true })
+  }
+})
+
+test('importing the checker with node -e does not execute the CLI', () => {
+  const result = spawnSync(process.execPath, [
+    '-e', "import('./scripts/check-contribution-handoff.mjs')", 'foo',
+  ], { encoding: 'utf8', cwd: fileURLToPath(new URL('../', import.meta.url)) })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, '')
+  assert.equal(result.stderr, '')
 })
