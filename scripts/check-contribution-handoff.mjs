@@ -5,8 +5,7 @@
  * It validates the presence and shape of continuation information. It does
  * not run commands, fetch evidence, assign maintainers, or grant permissions.
  */
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readFileSync, realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const STATES = new Set(['in-progress', 'paused', 'complete'])
@@ -71,8 +70,10 @@ function checkFile(file) {
   return validateContributionHandoff(document)
 }
 
-const invokedAsScript = process.argv[1] &&
-  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+let invokedAsScript = false
+try {
+  invokedAsScript = import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+} catch {}
 
 if (invokedAsScript) {
   const files = process.argv.slice(2)
